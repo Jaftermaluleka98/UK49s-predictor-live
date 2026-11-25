@@ -1,0 +1,31 @@
+name: Auto Update UK49s Results
+on:
+  schedule:
+    - cron: '5 17 * * *'  # 19:05 SA time = 17:05 UTC, after Teatime
+  workflow_dispatch:  # Allows you to press Run manually
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install libraries
+        run: pip install requests beautifulsoup4 pandas
+
+      - name: Fetch results
+        run: python fetch_results.py
+
+      - name: Save new data.csv
+        run: |
+          git config user.name "Auto Bot"
+          git config user.email "bot@uk49.com"
+          git add data.csv
+          git commit -m "Auto update results" || echo "No new results"
+          git push
