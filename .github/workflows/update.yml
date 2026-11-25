@@ -4,6 +4,9 @@ on:
     - cron: '5 17 * * *'  # 19:05 SA time = 17:05 UTC, after Teatime
   workflow_dispatch:  # Allows you to press Run manually
 
+permissions:   # ✅ ADD THIS
+  contents: write  # ✅ ADD THIS
+
 jobs:
   update:
     runs-on: ubuntu-latest
