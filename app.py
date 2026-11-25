@@ -18,6 +18,7 @@ st.markdown("""
 .gold { border: 4px solid gold !important; box-shadow: 0 0 15px gold !important; }
 .yesterday-box { background:#1a1a1a; border:2px solid gold; padding:15px; border-radius:12px; color:white; margin-bottom:15px; }
 .today-box { background: linear-gradient(90deg, #0040a8, #a80000); padding:10px; border-radius:10px; color:white; text-align:center; font-weight:bold; }
+.today-result-box { background:#0a2a0a; border:2px solid #00ff00; padding:15px; border-radius:12px; color:white; margin-bottom:15px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -25,6 +26,7 @@ st.markdown("""
 today = date.today()
 yesterday = today - timedelta(days=1)
 tomorrow = today + timedelta(days=1)
+cols_main = ['Num1','Num2','Num3','Num4','Num5','Num6']
 
 st.markdown(f'<div class="today-box">📅 TODAY: {today.strftime("%A, %d %B %Y")} | Lunchtime 12:49 | Teatime 17:49 (UK Time) | SA Time: 13:49 / 18:49</div>', unsafe_allow_html=True)
 st.write("")
@@ -43,30 +45,24 @@ from datetime import date, timedelta
 @st.cache_data(ttl=3600)  # refresh every 1 hour
 def get_live_data():
     try:
-        # 49s official results page - Lunchtime & Teatime
         url = "https://www.49s.co.uk/results"
         r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
         soup = BeautifulSoup(r.text, 'html.parser')
         rows = []
-        # The site lists results in tables - we parse them
-        # Fallback if site blocks us: use backup API
         return None
     except:
         return None
 
 def load_data():
-    # Try live first
     live = get_live_data()
     if live is not None:
         return live
-    # Fallback to CSV
     df = pd.read_csv('data.csv')
     df['Date'] = pd.to_datetime(df['Date']).dt.date
     return df
 
 try:
     df = pd.read_csv('data.csv')
-    # Make sure Date is date type
     df['Date'] = pd.to_datetime(df['Date']).dt.date
     # Only use draws BEFORE selected date (no future leaking)
     df = df[df['Date'] < selected_date].sort_values('Date', ascending=False).reset_index(drop=True)
@@ -76,28 +72,51 @@ except:
     st.error("Need data.csv with Date,Draw,Num1...Booster")
     st.stop()
 
-# ===== YESTERDAY RESULTS ON TOP - BOTH DRAWS =====
-st.subheader(f"📊 Yesterday's Results - {yesterday.strftime('%A, %d %B %Y')}")
-yest = df_all[df_all['Date'] == yesterday]
-
-if len(yest) == 0:
-    # Fallback: show most recent date in file
-    last_date = df_all['Date'].max()
-    yest = df_all[df_all['Date'] == last_date]
-    st.warning(f"No data for yesterday yet - showing last available: {last_date.strftime('%A, %d %B %Y')}")
-
-cols_main = ['Num1','Num2','Num3','Num4','Num5','Num6']
-for _, row in yest.iterrows():
+# Helper to draw one result box
+def show_result_box(row, box_class="yesterday-box"):
     nums = [int(row[c]) for c in cols_main]
     booster = int(row['Booster'])
     high = sum(1 for x in nums if x >= 25)
-    html = f'<div class="yesterday-box"><b>{row["Draw"]} - {row["Date"]}:</b> '
+    html = f'<div class="{box_class}"><b>{row["Draw"]} - {row["Date"]}:</b> '
     for n in nums:
         cls = "high" if n >= 25 else "low"
         html += f'<span class="ball {cls}">{n}</span>'
     html += f' + Booster: <span class="ball {"high" if booster>=25 else "low"}">{booster}</span>'
     html += f'<br><small>{high} High / {6-high} Low | Sum: {sum(nums)} | Odd/Even: {sum(1 for x in nums if x%2==1)}/{sum(1 for x in nums if x%2==0)}</small></div>'
     st.markdown(html, unsafe_allow_html=True)
+
+# ===== TODAY'S RESULTS - SHOWS AS SOON AS IT'S OUT =====
+st.subheader(f"🔴 TODAY'S Results - {today.strftime('%A, %d %B %Y')}")
+today_rows = df_all[df_all['Date'] == today]
+
+if len(today_rows) == 0:
+    st.info("⏳ No results for today yet. Lunchtime comes at 13:49 SA time, Teatime at 18:49 SA time. Prediction grid below is for the next draw.")
+else:
+    # Lunchtime
+    lunch_today = today_rows[today_rows['Draw'] == 'Lunchtime']
+    if len(lunch_today) > 0:
+        show_result_box(lunch_today.iloc[0], box_class="today-result-box")
+    else:
+        st.info("⏳ Lunchtime today - still to come (13:49 SA / 12:49 UK)")
+
+    # Teatime
+    tea_today = today_rows[today_rows['Draw'] == 'Teatime']
+    if len(tea_today) > 0:
+        show_result_box(tea_today.iloc[0], box_class="today-result-box")
+    else:
+        st.info("⏳ Teatime today - still to come (18:49 SA / 17:49 UK)")
+
+# ===== YESTERDAY RESULTS BELOW =====
+st.subheader(f"📊 Yesterday's Results - {yesterday.strftime('%A, %d %B %Y')}")
+yest = df_all[df_all['Date'] == yesterday]
+
+if len(yest) == 0:
+    last_date = df_all['Date'].max()
+    yest = df_all[df_all['Date'] == last_date]
+    st.warning(f"No data for yesterday yet - showing last available: {last_date.strftime('%A, %d %B %Y')}")
+
+for _, row in yest.iterrows():
+    show_result_box(row, box_class="yesterday-box")
 
 # Did yesterday's numbers hit our hot numbers?
 st.caption("Check: Did any of yesterday's numbers appear in today's Hot list below? If yes, the system is tracking well.")
@@ -145,7 +164,6 @@ for n in range(1, 50):
     best_partner[n] = partners[0] if partners else (None, 0)
 
 # ===== 3. NEW: TRIPLES =====
-# Count every triple
 triple_counts = Counter()
 for _, row in df_pred.iterrows():
     nums = [row[c] for c in cols[:6]]
@@ -154,7 +172,6 @@ for _, row in df_pred.iterrows():
 
 top_triples = triple_counts.most_common(10)
 
-# For a given pair, find best 3rd number
 def best_third_for_pair(pair):
     a, b = sorted(pair)
     candidates = []
@@ -221,10 +238,8 @@ if p1 != p2:
 st.subheader(f"🎯 Final Combos for {selected_date.strftime('%A %d %B')} - {draw_type}")
 def build_combo_from_triple(triple):
     combo = list(triple)
-    # Add banker if not in
     if banker not in combo and len(combo) < 6:
         combo.append(banker)
-    # Fill with best predictions
     for b in ball_names[:6]:
         for num, _ in predictions[b]:
             if num not in combo and len(combo) < 6:
@@ -235,7 +250,6 @@ def build_combo_from_triple(triple):
         if n not in combo: combo.append(n)
     return sorted(combo)
 
-# Combo 1 = Top triple + banker
 combo1 = build_combo_from_triple(top_triples[0][0] if top_triples else (banker,1,2))
 combo2 = build_combo_from_triple(top_triples[1][0] if len(top_triples)>1 else (banker,1,2))
 combo3 = build_combo_from_triple(top_triples[2][0] if len(top_triples)>2 else (banker,1,2))
