@@ -1,12 +1,9 @@
 import streamlit as st
 import pandas as pd
 import random
-import re
-import requests
 from collections import Counter
 from itertools import combinations
-from datetime import date, timedelta, datetime
-from bs4 import BeautifulSoup
+from datetime import date, timedelta
 
 st.set_page_config(page_title="UK49s - Daily Triples Predictor", layout="centered")
 
@@ -22,7 +19,6 @@ st.markdown("""
 .yesterday-box { background:#1a1a1a; border:2px solid gold; padding:15px; border-radius:12px; color:white; margin-bottom:15px; }
 .today-box { background: linear-gradient(90deg, #0040a8, #a80000); padding:10px; border-radius:10px; color:white; text-align:center; font-weight:bold; }
 .today-result-box { background:#0a2a0a; border:2px solid #00ff00; padding:15px; border-radius:12px; color:white; margin-bottom:15px; }
-.live-badge { background:#00c853; color:white; padding:3px 10px; border-radius:20px; font-size:13px; font-weight:bold; }
 .csv-badge { background:#ff9800; color:white; padding:3px 10px; border-radius:20px; font-size:13px; font-weight:bold; }
 </style>
 """, unsafe_allow_html=True)
@@ -41,95 +37,9 @@ st.caption(f"You are predicting for: {selected_date.strftime('%A, %d %B %Y')}")
 draw_type = st.selectbox("Choose Draw", ["Lunchtime", "Teatime"])
 lookback = st.slider("Use last N draws for stats", 20, 300, 100)
 
-# ===== LIVE FETCH - 49s.co.uk + BACKUP SITES =====
-@st.cache_data(ttl=120)
-def get_live_data():
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    rows = []
-
-    # Try sites that don't block bots - in order
-    urls = [
-        "https://uk49slatestresults.co.za/",
-        "https://fortunegames.com/49s-results/",
-        "https://www.irishlottery.com/49s-results",
-    ]
-
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code != 200:
-                continue
-            soup = BeautifulSoup(r.text, 'html.parser')
-            text = soup.get_text(" ", strip=True)
-
-            # Look for patterns like "25 November 2026" + Lunchtime/Teatime + 7 numbers
-            # We scan for all dates in the page
-            for m in re.finditer(r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})', text):
-                try:
-                    d = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y").date()
-                except:
-                    continue
-                # Take a window of text after this date (next 500 chars) and look for Lunchtime/Teatime + numbers
-                window = text[m.start():m.start()+800]
-                for draw in ['Lunchtime', 'Teatime']:
-                    if draw in window:
-                        # Find 7 numbers after the draw name in window
-                        after = window[window.find(draw):window.find(draw)+300]
-                        nums = [int(x) for x in re.findall(r'\b(\d{1,2})\b', after) if 1 <= int(x) <= 49]
-                        # Remove draw-time numbers like 13, 49, 18, 49 - need at least 7, take first 7 that look like balls
-                        # This site lists balls as "11 12 19 20 43 45 05" - so take first 7
-                        if len(nums) >= 7:
-                            balls = nums[:7]
-                            rows.append([d, draw] + sorted(balls[:6]) + [balls[6]])
-                # Only need last 7 days
-                if len(rows) > 20:
-                    break
-            if len(rows) > 0:
-                break
-        except:
-            continue
-
-    if len(rows) == 0:
-        return None
-
-    live_df = pd.DataFrame(rows, columns=['Date','Draw','Num1','Num2','Num3','Num4','Num5','Num6','Booster'])
-    live_df = live_df.drop_duplicates(subset=['Date','Draw']).sort_values('Date', ascending=False)
-    return live_df
-
-    # --- SOURCE 2: uk49sresults / lottery site backup - JSON style ---
-    # This site has a clean table: https://www.49sresults.co.uk
-    if len(rows) == 0:
-        try:
-            r = requests.get("https://www.49sresults.co.uk/", headers=headers, timeout=15)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, 'html.parser')
-                for tr in soup.find_all('tr'):
-                    cells = [c.get_text(strip=True) for c in tr.find_all(['td','th'])]
-                    # Expect: Date | Draw | 6 numbers | Booster
-                    if len(cells) >= 8:
-                        try:
-                            d = pd.to_datetime(cells[0]).date()
-                            draw = cells[1]
-                            if draw not in ['Lunchtime','Teatime']:
-                                continue
-                            nums = [int(x) for x in cells[2:8] if x.isdigit()]
-                            if len(nums) == 6:
-                                # Booster is often in next cell
-                                booster = int(cells[8]) if len(cells) > 8 and cells[8].isdigit() else nums[-1]
-                                rows.append([d, draw] + sorted(nums) + [booster])
-                        except:
-                            continue
-        except:
-            pass
-
-    if len(rows) == 0:
-        return None
-
-    live_df = pd.DataFrame(rows, columns=['Date','Draw','Num1','Num2','Num3','Num4','Num5','Num6','Booster'])
-    live_df = live_df.drop_duplicates(subset=['Date','Draw']).sort_values('Date', ascending=False)
-    return live_df
-
-# ===== LOAD DATA: LIVE + CSV MERGED, LIVE WINS =====
+# ===== LOAD DATA: CSV ONLY - NO LIVE SCRAPER =====
+# LIVE was disabled because it picked up times like 13:49 as balls
+# and overwrote correct CSV data with wrong numbers.
 try:
     csv_df = pd.read_csv('data.csv')
     csv_df['Date'] = pd.to_datetime(csv_df['Date']).dt.date
@@ -137,22 +47,13 @@ except:
     st.error("Need data.csv with Date,Draw,Num1...Booster")
     st.stop()
 
-live_df = get_live_data()
-
-if live_df is not None and len(live_df) > 0:
-    st.markdown('<span class="live-badge">● LIVE from 49s.co.uk</span> <small>Auto-refreshes every 2 min - no typing needed</small>', unsafe_allow_html=True)
-    # Merge: live overwrites CSV for same Date+Draw, CSV fills history
-    df_all = pd.concat([live_df, csv_df]).drop_duplicates(subset=['Date','Draw'], keep='first').sort_values('Date', ascending=False).reset_index(drop=True)
-    data_source = "LIVE"
-else:
-    st.markdown('<span class="csv-badge">⚠ OFFLINE - Using data.csv backup</span> <small>Live site blocked us, showing file. Check your internet / 49s.co.uk</small>', unsafe_allow_html=True)
-    df_all = csv_df.sort_values('Date', ascending=False).reset_index(drop=True)
-    data_source = "CSV"
+st.markdown('<span class="csv-badge">✓ Using data.csv - Verified Data Only</span> <small>No live scraper - CSV is the truth</small>', unsafe_allow_html=True)
+df_all = csv_df.sort_values('Date', ascending=False).reset_index(drop=True)
+data_source = "CSV"
 
 # For predictions: only draws BEFORE selected date
 df = df_all[df_all['Date'] < selected_date].sort_values('Date', ascending=False).reset_index(drop=True)
 
-# Helper to draw one result box
 def show_result_box(row, box_class="yesterday-box"):
     nums = [int(row[c]) for c in cols_main]
     booster = int(row['Booster'])
@@ -165,7 +66,7 @@ def show_result_box(row, box_class="yesterday-box"):
     html += f'<br><small>{high} High / {6-high} Low | Sum: {sum(nums)} | Odd/Even: {sum(1 for x in nums if x%2==1)}/{sum(1 for x in nums if x%2==0)}</small></div>'
     st.markdown(html, unsafe_allow_html=True)
 
-# ===== TODAY'S RESULTS - LIVE =====
+# ===== TODAY'S RESULTS =====
 st.subheader(f"🔴 TODAY'S Results - {today.strftime('%A, %d %B %Y')} - Source: {data_source}")
 today_rows = df_all[df_all['Date'] == today]
 
@@ -183,11 +84,7 @@ else:
     else:
         st.info("⏳ Teatime today - still to come (18:49 SA / 17:49 UK)")
 
-if st.button("🔄 Refresh Live Results Now"):
-    st.cache_data.clear()
-    st.rerun()
-
-# ===== YESTERDAY RESULTS BELOW =====
+# ===== YESTERDAY RESULTS =====
 st.subheader(f"📊 Yesterday's Results - {yesterday.strftime('%A, %d %B %Y')}")
 yest = df_all[df_all['Date'] == yesterday]
 if len(yest) == 0:
@@ -329,5 +226,37 @@ last7 = df_all[df_all['Date'] >= today - timedelta(days=7)].sort_values('Date', 
 for _, row in last7.head(14).iterrows():
     nums = [int(row[c]) for c in cols_main]
     st.write(f"**{row['Date']} - {row['Draw']}:** {nums} + Booster {int(row['Booster'])}")
+
+# ===== ADD RESULT HELPER - PREVENTS TYPING ERRORS =====
+st.divider()
+st.subheader("➕ Add New Result - Helper")
+st.caption("Type the numbers exactly as you see them on the 49's app. This will build the correct line for data.csv. Do NOT add before the draw happens.")
+with st.expander("Add a result", expanded=False):
+    add_date = st.date_input("Result Date", value=today, key="add_date")
+    add_draw = st.selectbox("Draw", ["Lunchtime", "Teatime"], key="add_draw")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    n1 = c1.number_input("Ball 1", 1, 49, 1, key="n1")
+    n2 = c2.number_input("Ball 2", 1, 49, 2, key="n2")
+    n3 = c3.number_input("Ball 3", 1, 49, 3, key="n3")
+    n4 = c4.number_input("Ball 4", 1, 49, 4, key="n4")
+    n5 = c5.number_input("Ball 5", 1, 49, 5, key="n5")
+    n6 = c6.number_input("Ball 6", 1, 49, 6, key="n6")
+    booster_in = st.number_input("Booster", 1, 49, 7, key="booster_in")
+    balls_sorted = sorted([n1, n2, n3, n4, n5, n6])
+    # Check for duplicates / booster clash
+    if len(set([n1,n2,n3,n4,n5,n6])) < 6:
+        st.error("❌ You have duplicate numbers - check again, 6 balls must all be different.")
+    elif booster_in in balls_sorted:
+        st.error("❌ Booster cannot be same as one of the 6 main balls.")
+    else:
+        line = f"{add_date},{add_draw},{balls_sorted[0]},{balls_sorted[1]},{balls_sorted[2]},{balls_sorted[3]},{balls_sorted[4]},{balls_sorted[5]},{booster_in}"
+        st.success("Copy this ONE line to the TOP of data.csv (under the header):")
+        st.code(line)
+        # Check if already exists
+        exists = ((df_all['Date'] == add_date) & (df_all['Draw'] == add_draw)).any()
+        if exists:
+            st.warning(f"⚠️ {add_date} {add_draw} ALREADY exists in data.csv - do NOT add again, you will duplicate it.")
+        else:
+            st.info("✅ This draw is not in data.csv yet - safe to add after the draw.")
 
 st.warning("⚠️ Stats only - UK49s is random.")
