@@ -42,53 +42,59 @@ draw_type = st.selectbox("Choose Draw", ["Lunchtime", "Teatime"])
 lookback = st.slider("Use last N draws for stats", 20, 300, 100)
 
 # ===== LIVE FETCH - 49s.co.uk + BACKUP SITES =====
-@st.cache_data(ttl=120)  # refresh every 2 minutes
+@st.cache_data(ttl=120)
 def get_live_data():
-    """
-    Try 3 live sources. Returns DataFrame with Date,Draw,Num1..Booster
-    or None if all fail. We parse the HTML tables - 49s lists balls in order.
-    """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     rows = []
 
-    # --- SOURCE 1: 49s.co.uk results page ---
-    try:
-        r = requests.get("https://www.49s.co.uk/results", headers=headers, timeout=15)
-        if r.status_code == 200:
+    # Try sites that don't block bots - in order
+    urls = [
+        "https://uk49slatestresults.co.za/",
+        "https://fortunegames.com/49s-results/",
+        "https://www.irishlottery.com/49s-results",
+    ]
+
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                continue
             soup = BeautifulSoup(r.text, 'html.parser')
             text = soup.get_text(" ", strip=True)
-            # Look for patterns like "25 November 2026" near Lunchtime / Teatime
-            # 49s shows each draw as a block with 6 balls + booster
-            # We scan all result cards
-            for card in soup.find_all(['div','section','article']):
-                card_text = card.get_text(" ", strip=True)
-                if 'Lunchtime' in card_text or 'Teatime' in card_text:
-                    # Find date in card
-                    m_date = re.search(r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})', card_text)
-                    if not m_date:
-                        continue
-                    try:
-                        d = datetime.strptime(f"{m_date.group(1)} {m_date.group(2)} {m_date.group(3)}", "%d %B %Y").date()
-                    except:
-                        continue
-                    # Balls are in elements with class containing 'ball' or 'number'
-                    balls = []
-                    for el in card.find_all(['span','div','li']):
-                        cls = " ".join(el.get('class', [])) if el.get('class') else ""
-                        if 'ball' in cls.lower() or 'number' in cls.lower():
-                            t = el.get_text(strip=True)
-                            if t.isdigit() and 1 <= int(t) <= 49:
-                                balls.append(int(t))
-                    # Need at least 7 balls (6 + booster)
-                    if len(balls) >= 7:
-                        draw = 'Lunchtime' if 'Lunchtime' in card_text else 'Teatime'
-                        # If card has both draws, split - skip complex cards
-                        if 'Lunchtime' in card_text and 'Teatime' in card_text:
-                            continue
-                        balls = balls[:7]
-                        rows.append([d, draw] + sorted(balls[:6]) + [balls[6]])
-    except Exception as e:
-        pass
+
+            # Look for patterns like "25 November 2026" + Lunchtime/Teatime + 7 numbers
+            # We scan for all dates in the page
+            for m in re.finditer(r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})', text):
+                try:
+                    d = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y").date()
+                except:
+                    continue
+                # Take a window of text after this date (next 500 chars) and look for Lunchtime/Teatime + numbers
+                window = text[m.start():m.start()+800]
+                for draw in ['Lunchtime', 'Teatime']:
+                    if draw in window:
+                        # Find 7 numbers after the draw name in window
+                        after = window[window.find(draw):window.find(draw)+300]
+                        nums = [int(x) for x in re.findall(r'\b(\d{1,2})\b', after) if 1 <= int(x) <= 49]
+                        # Remove draw-time numbers like 13, 49, 18, 49 - need at least 7, take first 7 that look like balls
+                        # This site lists balls as "11 12 19 20 43 45 05" - so take first 7
+                        if len(nums) >= 7:
+                            balls = nums[:7]
+                            rows.append([d, draw] + sorted(balls[:6]) + [balls[6]])
+                # Only need last 7 days
+                if len(rows) > 20:
+                    break
+            if len(rows) > 0:
+                break
+        except:
+            continue
+
+    if len(rows) == 0:
+        return None
+
+    live_df = pd.DataFrame(rows, columns=['Date','Draw','Num1','Num2','Num3','Num4','Num5','Num6','Booster'])
+    live_df = live_df.drop_duplicates(subset=['Date','Draw']).sort_values('Date', ascending=False)
+    return live_df
 
     # --- SOURCE 2: uk49sresults / lottery site backup - JSON style ---
     # This site has a clean table: https://www.49sresults.co.uk
