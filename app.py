@@ -1,9 +1,12 @@
 import streamlit as st
 import pandas as pd
 import random
+import re
+import requests
 from collections import Counter
 from itertools import combinations
 from datetime import date, timedelta, datetime
+from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="UK49s - Daily Triples Predictor", layout="centered")
 
@@ -19,10 +22,12 @@ st.markdown("""
 .yesterday-box { background:#1a1a1a; border:2px solid gold; padding:15px; border-radius:12px; color:white; margin-bottom:15px; }
 .today-box { background: linear-gradient(90deg, #0040a8, #a80000); padding:10px; border-radius:10px; color:white; text-align:center; font-weight:bold; }
 .today-result-box { background:#0a2a0a; border:2px solid #00ff00; padding:15px; border-radius:12px; color:white; margin-bottom:15px; }
+.live-badge { background:#00c853; color:white; padding:3px 10px; border-radius:20px; font-size:13px; font-weight:bold; }
+.csv-badge { background:#ff9800; color:white; padding:3px 10px; border-radius:20px; font-size:13px; font-weight:bold; }
 </style>
 """, unsafe_allow_html=True)
 
-# ===== DATES - EVERYDAY =====
+# ===== DATES =====
 today = date.today()
 yesterday = today - timedelta(days=1)
 tomorrow = today + timedelta(days=1)
@@ -31,46 +36,115 @@ cols_main = ['Num1','Num2','Num3','Num4','Num5','Num6']
 st.markdown(f'<div class="today-box">📅 TODAY: {today.strftime("%A, %d %B %Y")} | Lunchtime 12:49 | Teatime 17:49 (UK Time) | SA Time: 13:49 / 18:49</div>', unsafe_allow_html=True)
 st.write("")
 
-# Date selector - pick any day to predict for
 selected_date = st.date_input("📅 Predict for date", value=today, min_value=today - timedelta(days=7), max_value=tomorrow)
 st.caption(f"You are predicting for: {selected_date.strftime('%A, %d %B %Y')}")
-
 draw_type = st.selectbox("Choose Draw", ["Lunchtime", "Teatime"])
 lookback = st.slider("Use last N draws for stats", 20, 300, 100)
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-from datetime import date, timedelta
 
-@st.cache_data(ttl=3600)  # refresh every 1 hour
+# ===== LIVE FETCH - 49s.co.uk + BACKUP SITES =====
+@st.cache_data(ttl=120)  # refresh every 2 minutes
 def get_live_data():
+    """
+    Try 3 live sources. Returns DataFrame with Date,Draw,Num1..Booster
+    or None if all fail. We parse the HTML tables - 49s lists balls in order.
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    rows = []
+
+    # --- SOURCE 1: 49s.co.uk results page ---
     try:
-        url = "https://www.49s.co.uk/results"
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        rows = []
-        return None
-    except:
+        r = requests.get("https://www.49s.co.uk/results", headers=headers, timeout=15)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            text = soup.get_text(" ", strip=True)
+            # Look for patterns like "25 November 2026" near Lunchtime / Teatime
+            # 49s shows each draw as a block with 6 balls + booster
+            # We scan all result cards
+            for card in soup.find_all(['div','section','article']):
+                card_text = card.get_text(" ", strip=True)
+                if 'Lunchtime' in card_text or 'Teatime' in card_text:
+                    # Find date in card
+                    m_date = re.search(r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})', card_text)
+                    if not m_date:
+                        continue
+                    try:
+                        d = datetime.strptime(f"{m_date.group(1)} {m_date.group(2)} {m_date.group(3)}", "%d %B %Y").date()
+                    except:
+                        continue
+                    # Balls are in elements with class containing 'ball' or 'number'
+                    balls = []
+                    for el in card.find_all(['span','div','li']):
+                        cls = " ".join(el.get('class', [])) if el.get('class') else ""
+                        if 'ball' in cls.lower() or 'number' in cls.lower():
+                            t = el.get_text(strip=True)
+                            if t.isdigit() and 1 <= int(t) <= 49:
+                                balls.append(int(t))
+                    # Need at least 7 balls (6 + booster)
+                    if len(balls) >= 7:
+                        draw = 'Lunchtime' if 'Lunchtime' in card_text else 'Teatime'
+                        # If card has both draws, split - skip complex cards
+                        if 'Lunchtime' in card_text and 'Teatime' in card_text:
+                            continue
+                        balls = balls[:7]
+                        rows.append([d, draw] + sorted(balls[:6]) + [balls[6]])
+    except Exception as e:
+        pass
+
+    # --- SOURCE 2: uk49sresults / lottery site backup - JSON style ---
+    # This site has a clean table: https://www.49sresults.co.uk
+    if len(rows) == 0:
+        try:
+            r = requests.get("https://www.49sresults.co.uk/", headers=headers, timeout=15)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, 'html.parser')
+                for tr in soup.find_all('tr'):
+                    cells = [c.get_text(strip=True) for c in tr.find_all(['td','th'])]
+                    # Expect: Date | Draw | 6 numbers | Booster
+                    if len(cells) >= 8:
+                        try:
+                            d = pd.to_datetime(cells[0]).date()
+                            draw = cells[1]
+                            if draw not in ['Lunchtime','Teatime']:
+                                continue
+                            nums = [int(x) for x in cells[2:8] if x.isdigit()]
+                            if len(nums) == 6:
+                                # Booster is often in next cell
+                                booster = int(cells[8]) if len(cells) > 8 and cells[8].isdigit() else nums[-1]
+                                rows.append([d, draw] + sorted(nums) + [booster])
+                        except:
+                            continue
+        except:
+            pass
+
+    if len(rows) == 0:
         return None
 
-def load_data():
-    live = get_live_data()
-    if live is not None:
-        return live
-    df = pd.read_csv('data.csv')
-    df['Date'] = pd.to_datetime(df['Date']).dt.date
-    return df
+    live_df = pd.DataFrame(rows, columns=['Date','Draw','Num1','Num2','Num3','Num4','Num5','Num6','Booster'])
+    live_df = live_df.drop_duplicates(subset=['Date','Draw']).sort_values('Date', ascending=False)
+    return live_df
 
+# ===== LOAD DATA: LIVE + CSV MERGED, LIVE WINS =====
 try:
-    df = pd.read_csv('data.csv')
-    df['Date'] = pd.to_datetime(df['Date']).dt.date
-    # Only use draws BEFORE selected date (no future leaking)
-    df = df[df['Date'] < selected_date].sort_values('Date', ascending=False).reset_index(drop=True)
-    df_all = pd.read_csv('data.csv')
-    df_all['Date'] = pd.to_datetime(df_all['Date']).dt.date
+    csv_df = pd.read_csv('data.csv')
+    csv_df['Date'] = pd.to_datetime(csv_df['Date']).dt.date
 except:
     st.error("Need data.csv with Date,Draw,Num1...Booster")
     st.stop()
+
+live_df = get_live_data()
+
+if live_df is not None and len(live_df) > 0:
+    st.markdown('<span class="live-badge">● LIVE from 49s.co.uk</span> <small>Auto-refreshes every 2 min - no typing needed</small>', unsafe_allow_html=True)
+    # Merge: live overwrites CSV for same Date+Draw, CSV fills history
+    df_all = pd.concat([live_df, csv_df]).drop_duplicates(subset=['Date','Draw'], keep='first').sort_values('Date', ascending=False).reset_index(drop=True)
+    data_source = "LIVE"
+else:
+    st.markdown('<span class="csv-badge">⚠ OFFLINE - Using data.csv backup</span> <small>Live site blocked us, showing file. Check your internet / 49s.co.uk</small>', unsafe_allow_html=True)
+    df_all = csv_df.sort_values('Date', ascending=False).reset_index(drop=True)
+    data_source = "CSV"
+
+# For predictions: only draws BEFORE selected date
+df = df_all[df_all['Date'] < selected_date].sort_values('Date', ascending=False).reset_index(drop=True)
 
 # Helper to draw one result box
 def show_result_box(row, box_class="yesterday-box"):
@@ -85,40 +159,38 @@ def show_result_box(row, box_class="yesterday-box"):
     html += f'<br><small>{high} High / {6-high} Low | Sum: {sum(nums)} | Odd/Even: {sum(1 for x in nums if x%2==1)}/{sum(1 for x in nums if x%2==0)}</small></div>'
     st.markdown(html, unsafe_allow_html=True)
 
-# ===== TODAY'S RESULTS - SHOWS AS SOON AS IT'S OUT =====
-st.subheader(f"🔴 TODAY'S Results - {today.strftime('%A, %d %B %Y')}")
+# ===== TODAY'S RESULTS - LIVE =====
+st.subheader(f"🔴 TODAY'S Results - {today.strftime('%A, %d %B %Y')} - Source: {data_source}")
 today_rows = df_all[df_all['Date'] == today]
 
 if len(today_rows) == 0:
     st.info("⏳ No results for today yet. Lunchtime comes at 13:49 SA time, Teatime at 18:49 SA time. Prediction grid below is for the next draw.")
 else:
-    # Lunchtime
     lunch_today = today_rows[today_rows['Draw'] == 'Lunchtime']
     if len(lunch_today) > 0:
         show_result_box(lunch_today.iloc[0], box_class="today-result-box")
     else:
         st.info("⏳ Lunchtime today - still to come (13:49 SA / 12:49 UK)")
-
-    # Teatime
     tea_today = today_rows[today_rows['Draw'] == 'Teatime']
     if len(tea_today) > 0:
         show_result_box(tea_today.iloc[0], box_class="today-result-box")
     else:
         st.info("⏳ Teatime today - still to come (18:49 SA / 17:49 UK)")
 
+if st.button("🔄 Refresh Live Results Now"):
+    st.cache_data.clear()
+    st.rerun()
+
 # ===== YESTERDAY RESULTS BELOW =====
 st.subheader(f"📊 Yesterday's Results - {yesterday.strftime('%A, %d %B %Y')}")
 yest = df_all[df_all['Date'] == yesterday]
-
 if len(yest) == 0:
     last_date = df_all['Date'].max()
     yest = df_all[df_all['Date'] == last_date]
     st.warning(f"No data for yesterday yet - showing last available: {last_date.strftime('%A, %d %B %Y')}")
-
 for _, row in yest.iterrows():
     show_result_box(row, box_class="yesterday-box")
 
-# Did yesterday's numbers hit our hot numbers?
 st.caption("Check: Did any of yesterday's numbers appear in today's Hot list below? If yes, the system is tracking well.")
 
 # ===== MAIN DATA FOR PREDICTION =====
@@ -126,7 +198,6 @@ df_pred = df[df['Draw'] == draw_type].head(lookback)
 cols = ['Num1','Num2','Num3','Num4','Num5','Num6','Booster']
 ball_names = ['Ball #1','Ball #2','Ball #3','Ball #4','Ball #5','Ball #6','Ball #7']
 
-# ===== 1. SCORES PER BALL =====
 def calculate_scores(ball_idx):
     col = cols[ball_idx]
     freq = df_pred[col].value_counts()
@@ -147,7 +218,6 @@ def calculate_scores(ball_idx):
 
 predictions = {ball_names[i]: calculate_scores(i) for i in range(7)}
 
-# ===== 2. PAIRS =====
 pair_counts = Counter()
 for _, row in df_pred.iterrows():
     nums = [row[c] for c in cols[:6]]
@@ -163,7 +233,6 @@ for n in range(1, 50):
     partners.sort(key=lambda x: x[1], reverse=True)
     best_partner[n] = partners[0] if partners else (None, 0)
 
-# ===== 3. NEW: TRIPLES =====
 triple_counts = Counter()
 for _, row in df_pred.iterrows():
     nums = [row[c] for c in cols[:6]]
@@ -182,7 +251,6 @@ def best_third_for_pair(pair):
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[0] if candidates else (None, 0)
 
-# ===== DISPLAY GRID =====
 st.subheader(f"🎱 Prediction Grid - {draw_type} - {selected_date.strftime('%d %B %Y')}")
 st.markdown("""
 <div class="header-bar">
@@ -211,18 +279,12 @@ for idx, ball in enumerate(ball_names):
 
 st.success(f"⭐ BANKER: {banker} | Best Partner: {best_partner[banker][0]} ({best_partner[banker][1]}x)")
 
-# ===== TRIPLES TABLE =====
 st.subheader("🔺 Top 10 Triples - When 2 Come, The 3rd Follows")
 triple_data = []
 for (a,b,c), cnt in top_triples:
-    triple_data.append({
-        'Triple': f"{a} + {b} + {c}",
-        'Times Together': cnt,
-        'Probability': f"{round(cnt/len(df_pred)*100,1)}%",
-    })
+    triple_data.append({'Triple': f"{a} + {b} + {c}", 'Times Together': cnt, 'Probability': f"{round(cnt/len(df_pred)*100,1)}%"})
 st.dataframe(pd.DataFrame(triple_data), use_container_width=True)
 
-# ===== TRIPLE CHECKER =====
 st.subheader("🔍 Triple Checker - Enter Any Pair")
 col1, col2 = st.columns(2)
 p1 = col1.number_input("First Number", 1, 49, banker)
@@ -234,7 +296,6 @@ if p1 != p2:
     else:
         st.write("No triple history for this pair yet - try another pair.")
 
-# ===== FINAL COMBOS BUILT FROM TRIPLES =====
 st.subheader(f"🎯 Final Combos for {selected_date.strftime('%A %d %B')} - {draw_type}")
 def build_combo_from_triple(triple):
     combo = list(triple)
@@ -253,16 +314,14 @@ def build_combo_from_triple(triple):
 combo1 = build_combo_from_triple(top_triples[0][0] if top_triples else (banker,1,2))
 combo2 = build_combo_from_triple(top_triples[1][0] if len(top_triples)>1 else (banker,1,2))
 combo3 = build_combo_from_triple(top_triples[2][0] if len(top_triples)>2 else (banker,1,2))
-
 for i, combo in enumerate([combo1, combo2, combo3], 1):
     high = sum(1 for x in combo if x >= 25)
     st.success(f"**Combo {i} for {selected_date.strftime('%d %B')} {draw_type}: {combo}** → {high} High / {6-high} Low | Booster: {banker}")
 
-# ===== DAILY HISTORY - Last 7 Days =====
 st.subheader("📅 Last 7 Days - Lunchtime & Teatime")
 last7 = df_all[df_all['Date'] >= today - timedelta(days=7)].sort_values('Date', ascending=False)
 for _, row in last7.head(14).iterrows():
     nums = [int(row[c]) for c in cols_main]
     st.write(f"**{row['Date']} - {row['Draw']}:** {nums} + Booster {int(row['Booster'])}")
 
-st.warning("⚠️ Stats only - UK49s is random. Check yesterday's results above to see how yesterday's prediction did.")
+st.warning("⚠️ Stats only - UK49s is random.")
